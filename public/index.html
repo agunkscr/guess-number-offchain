@@ -1,1 +1,222 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Guess Number – Autheo CX1 (Auto Play)</title>
+  <style>
+    body { font-family: Arial; padding: 20px; background: #f9f9f9; }
+    .card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; }
+    button { cursor: pointer; padding: 8px 12px; margin: 4px; border: none; border-radius: 4px; background: #4a90d9; color: white; }
+    button:hover { background: #357abd; }
+    input, select { padding: 6px; margin: 4px; }
+    .error { color: red; }
+    .success { color: green; }
+    pre { background: #eee; padding: 10px; }
+  </style>
+</head>
+<body>
+  <h1>🎯 Tebak Angka (1-10) – Autheo CX1</h1>
+  <button onclick="connectWallet()">🔌 Connect Wallet</button>
+  <span id="accountDisplay"></span>
 
+  <hr>
+
+  <!-- Admin Panel -->
+  <div id="adminSection" style="display:none">
+    <h3>Admin Panel</h3>
+    <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password">
+    <br>
+    <input id="maxPlayers" type="number" min="2" value="2" placeholder="Max Players">
+    <input id="betAmount" placeholder="Bet (CX1)" value="0.01">
+    <button onclick="createRoom()">Buat Room Manual</button>
+    <button onclick="autoGame()" style="background:#e67e22;">⚡ Auto Game (sekali)</button>
+
+    <hr style="margin-top:15px;">
+    <button onclick="startAutoLoop()" style="background:#27ae60;">▶ Mulai Auto-Loop</button>
+    <button onclick="stopAutoLoop()" style="background:#c0392b;">⏹ Hentikan Loop</button>
+    <span id="loopStatus"></span>
+
+    <div id="adminStatus"></div>
+  </div>
+
+  <h3>📋 Daftar Room</h3>
+  <div id="roomList">Loading...</div>
+
+  <div id="roomDetail" class="card" style="display:none"></div>
+
+  <h3>🏆 Leaderboard</h3>
+  <pre id="leaderboard">Loading...</pre>
+
+  <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
+  <script>
+    // ⚠️ GANTI DENGAN ALAMAT TREASURY YANG MUNCUL DI LOG SERVER
+    const TREASURY_ADDRESS = "PASTE_TREASURY_ADDRESS_HERE";
+
+    let provider, signer, account;
+
+    async function connectWallet() {
+      if (!window.ethereum) return alert('Install MetaMask!');
+      provider = new ethers.providers.Web3Provider(window.ethereum);
+      await provider.send("eth_requestAccounts", []);
+      signer = provider.getSigner();
+      account = await signer.getAddress();
+      document.getElementById('accountDisplay').innerText = `${account.substring(0,10)}...`;
+      document.getElementById('adminSection').style.display = 'block';
+      refreshRooms();
+      loadLeaderboard();
+    }
+
+    async function refreshRooms() {
+      try {
+        const res = await fetch('/api/rooms');
+        const rooms = await res.json();
+        const container = document.getElementById('roomList');
+        if (!rooms.length) { container.innerHTML = '<p>Belum ada room.</p>'; return; }
+        container.innerHTML = rooms.map(r => `
+          <div class="card">
+            <b>#${r.id}</b> | ${r.status} | Players: ${r.playerCount}/${r.maxPlayers} | Bet: ${r.betAmount} CX1
+            <button onclick="showRoomDetail(${r.id})">Detail</button>
+            ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim Taruhan</button>` : ''}
+          </div>
+        `).join('');
+      } catch(e) { console.error(e); }
+    }
+
+    async function showRoomDetail(roomId) {
+      const res = await fetch(`/api/rooms/${roomId}`);
+      const room = await res.json();
+      const div = document.getElementById('roomDetail');
+      div.style.display = 'block';
+      div.innerHTML = `
+        <h4>Room #${room.id}</h4>
+        <p>Status: <b>${room.status}</b> | Deadline: ${new Date(room.deadline).toLocaleString()}</p>
+        <p>Taruhan: ${room.betAmount} CX1</p>
+        ${room.secretNumber !== undefined ? `<p>Angka rahasia: <b>${room.secretNumber}</b></p>` : ''}
+        <p>Pemenang: ${room.winner || '-'}</p>
+        <h5>Pemain:</h5>
+        <ul>${room.players.map(p => `<li>${p.wallet.substring(0,8)}... - Tebak: ${p.guess ?? '?'} - Status: ${p.status}</li>`).join('')}</ul>
+      `;
+    }
+
+    // ========== MANUAL ==========
+    async function createRoom() {
+      const apiKey = document.getElementById('apiKey').value;
+      const maxPlayers = document.getElementById('maxPlayers').value;
+      const betAmount = document.getElementById('betAmount').value;
+      try {
+        const res = await fetch('/api/rooms', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify({ maxPlayers, betAmount })
+        });
+        const data = await res.json();
+        if (data.roomId) {
+          document.getElementById('adminStatus').innerHTML = `<span class="success">Room ${data.roomId} dibuat. Treasury: ${data.treasuryAddress}</span>`;
+          refreshRooms();
+        } else {
+          document.getElementById('adminStatus').innerHTML = `<span class="error">Error: ${data.error}</span>`;
+        }
+      } catch(e) { console.error(e); }
+    }
+
+    async function registerPlayer(roomId) {
+      if (!account) return alert('Hubungkan wallet dulu!');
+      const guess = prompt('Masukkan tebakan (1-10):');
+      if (!guess || guess<1 || guess>10) return;
+      const regRes = await fetch(`/api/rooms/${roomId}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ wallet: account, guess: parseInt(guess) })
+      });
+      const regData = await regRes.json();
+      if (!regData.success) return alert(regData.error);
+      alert('Terdaftar! Kirim CX1 via MetaMask.');
+      try {
+        const res = await fetch(`/api/rooms/${roomId}`);
+        const room = await res.json();
+        const tx = await signer.sendTransaction({
+          to: TREASURY_ADDRESS,
+          value: ethers.utils.parseEther(room.betAmount),
+          data: ethers.utils.hexZeroPad(ethers.utils.hexlify(roomId), 32)
+        });
+        alert('Transaksi dikirim: ' + tx.hash);
+        await tx.wait();
+        alert('Taruhan terkonfirmasi!');
+        refreshRooms();
+      } catch(e) { alert('Gagal: ' + e.message); }
+    }
+
+    // ========== AUTO ==========
+    async function autoGame() {
+      const apiKey = document.getElementById('apiKey').value;
+      const betAmount = document.getElementById('betAmount').value;
+      try {
+        const res = await fetch('/api/auto-game', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify({ betAmount })
+        });
+        const data = await res.json();
+        document.getElementById('adminStatus').innerHTML = `<span class="success">Auto game selesai! Room #${data.roomId} - ${data.status}</span>`;
+        refreshRooms();
+        loadLeaderboard();
+      } catch(e) { console.error(e); }
+    }
+
+    // ========== AUTO LOOP ==========
+    async function startAutoLoop() {
+      const apiKey = document.getElementById('apiKey').value;
+      const betAmount = document.getElementById('betAmount').value;
+      const statusEl = document.getElementById('loopStatus');
+      try {
+        const res = await fetch('/api/auto-loop/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey },
+          body: JSON.stringify({ betAmount })
+        });
+        const data = await res.json();
+        statusEl.innerText = data.error ? 'Error: ' + data.error : 'Loop berjalan...';
+        if (!data.error) monitorLoopStatus();
+      } catch(e) { console.error(e); }
+    }
+
+    async function stopAutoLoop() {
+      const apiKey = document.getElementById('apiKey').value;
+      const statusEl = document.getElementById('loopStatus');
+      try {
+        const res = await fetch('/api/auto-loop/stop', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
+        });
+        const data = await res.json();
+        statusEl.innerText = 'Loop dihentikan.';
+      } catch(e) { console.error(e); }
+    }
+
+    async function monitorLoopStatus() {
+      const statusEl = document.getElementById('loopStatus');
+      const interval = setInterval(async () => {
+        const res = await fetch('/api/auto-loop/status');
+        const data = await res.json();
+        if (!data.active) {
+          statusEl.innerText = `Berhenti. Total game: ${data.count}`;
+          clearInterval(interval);
+        } else {
+          statusEl.innerText = `Game #${data.count}... (taruhan ${data.betAmount})`;
+        }
+      }, 2000);
+    }
+
+    async function loadLeaderboard() {
+      const res = await fetch('/api/leaderboard');
+      const data = await res.json();
+      document.getElementById('leaderboard').innerText = data.length
+        ? data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n')
+        : 'Belum ada pemenang.';
+    }
+
+    // Auto-refresh rooms tiap 5 detik
+    setInterval(()=>{ if(account) { refreshRooms(); loadLeaderboard(); } }, 5000);
+  </script>
+</body>
+</html>
