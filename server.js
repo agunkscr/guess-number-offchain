@@ -5,6 +5,14 @@ const fs = require("fs").promises;
 const path = require("path");
 const { ethers } = require("ethers");
 
+// ========== GLOBAL ERROR HANDLERS ==========
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 // ========== ENV ==========
 const RPC_URL = process.env.RPC_URL_AUTHEO;
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
@@ -36,7 +44,7 @@ const cx1 = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, provider);
 
 // ========== STATE ==========
 let rooms = {};
-let processedTxs = new Set(); // menyimpan txHash dari event Transfer yang sudah diproses
+let processedTxs = new Set();
 let roomCounter = 0;
 
 // Auto-loop
@@ -101,7 +109,6 @@ async function resolveRoom(roomId) {
     const winner = winners[0];
     const totalPot = paidPlayers.reduce((sum, p) => sum + room.betAmountWei, 0n);
     try {
-      // Treasury mengirim CX1 ke pemenang
       const tx = await cx1.connect(wallet).transfer(winner.wallet, totalPot);
       await tx.wait();
       room.winner = winner.wallet;
@@ -113,7 +120,6 @@ async function resolveRoom(roomId) {
       return;
     }
   } else {
-    // Refund ke semua yang sudah bayar
     try {
       for (const p of paidPlayers) {
         const tx = await cx1.connect(wallet).transfer(p.wallet, room.betAmountWei);
@@ -159,10 +165,8 @@ async function handleCX1Transfer(from, to, value, event) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
 
-  // Hanya transfer ke treasury (toLowerCase untuk jaga-jaga)
   if (!to || to.toLowerCase() !== treasuryAddress.toLowerCase()) return;
 
-  // Cari room yang masih waiting dan player dengan wallet 'from' yang statusnya 'registered'
   for (const roomId of Object.keys(rooms)) {
     const room = rooms[roomId];
     if (room.status !== "waiting") continue;
@@ -170,26 +174,22 @@ async function handleCX1Transfer(from, to, value, event) {
       p => p.wallet.toLowerCase() === from.toLowerCase() && p.status === "registered"
     );
     if (!player) continue;
-    // Pastikan nominal sesuai
     if (value.lt(room.betAmountWei)) {
-      console.log(`Insufficient CX1 sent by ${from} for room ${roomId}: got ${ethers.utils.formatEther(value)}, expected ${room.betAmount}`);
+      console.log(`Insufficient CX1 from ${from} for room ${roomId}`);
       continue;
     }
-    // Tandai sudah bayar
     player.status = "paid";
     player.txHash = txHash;
     console.log(`Player ${from} paid ${ethers.utils.formatEther(value)} CX1 for room ${roomId}`);
     await saveData();
     checkRoomCompletion(parseInt(roomId));
-    break; // hanya cocokkan satu room per transfer
+    break;
   }
 }
 
-// ========== AUTO GAME (sekali main) ==========
+// ========== AUTO GAME ==========
 async function autoPlayRoom(betAmount, secretNumber) {
-  if (!player1 || !player2) {
-    throw new Error("Player wallets not configured. Set PRIVATE_KEY_PLAYER1 and PRIVATE_KEY_PLAYER2 in .env");
-  }
+  if (!player1 || !player2) throw new Error("Player wallets not set.");
   if (!CX1_TOKEN_ADDRESS) throw new Error("CX1_TOKEN_ADDRESS not set");
 
   roomCounter++;
@@ -221,7 +221,6 @@ async function autoPlayRoom(betAmount, secretNumber) {
 
   console.log(`Room ${roomId} created (secret: ${actualNumber})`);
 
-  // Kirim CX1 dari kedua player ke treasury
   const sendCX1 = async (playerWallet, addr) => {
     const tx = await cx1.connect(playerWallet).transfer(treasuryAddress, betWei);
     console.log(`${addr} sent CX1, tx: ${tx.hash}`);
@@ -229,19 +228,14 @@ async function autoPlayRoom(betAmount, secretNumber) {
     console.log(`${addr} CX1 transfer confirmed`);
   };
 
-  await Promise.all([
-    sendCX1(player1, player1.address),
-    sendCX1(player2, player2.address),
-  ]);
+  await Promise.all([sendCX1(player1, player1.address), sendCX1(player2, player2.address)]);
   console.log(`Both CX1 payments confirmed for room ${roomId}`);
-
-  // Tunggu sebentar agar event Transfer terpantau, lalu paksa cek resolusi
   await new Promise(r => setTimeout(r, 2000));
   await checkRoomCompletion(roomId);
   return rooms[roomId];
 }
 
-// ========== AUTO LOOP (berulang) ==========
+// ========== AUTO LOOP ==========
 async function startAutoLoop(betAmount) {
   if (autoLoopActive) return;
   autoLoopActive = true;
@@ -263,7 +257,7 @@ async function startAutoLoop(betAmount) {
     } catch (err) {
       console.error(`Auto-loop error at game #${autoLoopCount}:`, err.message);
     }
-  }, 30000); // setiap 30 detik
+  }, 30000);
 }
 
 function stopAutoLoop() {
@@ -285,6 +279,11 @@ function requireAdmin(req, res, next) {
   if (req.headers["x-api-key"] !== ADMIN_API_KEY) return res.status(403).json({ error: "Forbidden" });
   next();
 }
+
+// Health-check root
+app.get("/", (req, res) => {
+  res.json({ status: "ok", uptime: process.uptime() });
+});
 
 // Create room manual (admin)
 app.post("/api/rooms", requireAdmin, async (req, res) => {
@@ -364,13 +363,11 @@ app.get("/api/leaderboard", (req, res) => {
       wins[room.winner] = (wins[room.winner] || 0) + 1;
     }
   }
-  const sorted = Object.entries(wins)
-    .map(([wallet, count]) => ({ wallet, wins: count }))
-    .sort((a, b) => b.wins - a.wins);
+  const sorted = Object.entries(wins).map(([wallet, count]) => ({ wallet, wins: count })).sort((a, b) => b.wins - a.wins);
   res.json(sorted);
 });
 
-// Transactions history
+// Transactions
 app.get("/api/transactions", (req, res) => {
   const txs = [];
   for (const room of Object.values(rooms)) {
@@ -386,21 +383,13 @@ app.get("/api/transactions", (req, res) => {
   res.json(txs);
 });
 
-// Auto game (sekali)
+// Auto game sekali
 app.post("/api/auto-game", requireAdmin, async (req, res) => {
   const { betAmount = "0.01", secretNumber } = req.body;
   if (isNaN(parseFloat(betAmount)) || parseFloat(betAmount) <= 0) return res.status(400).json({ error: "Invalid betAmount" });
   try {
     const room = await autoPlayRoom(betAmount, secretNumber || undefined);
-    res.json({
-      message: "Auto game completed",
-      roomId: room.id,
-      status: room.status,
-      secretNumber: room.secretNumber,
-      winner: room.winner || "none (refund)",
-      players: room.players.map(p => ({ wallet: p.wallet, guess: p.guess, status: p.status })),
-      payoutTx: room.payoutTx,
-    });
+    res.json({ message: "Auto game completed", roomId: room.id, status: room.status, secretNumber: room.secretNumber, winner: room.winner || "none", players: room.players.map(p => ({ wallet: p.wallet, guess: p.guess, status: p.status })), payoutTx: room.payoutTx });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -423,7 +412,7 @@ app.get("/api/auto-loop/status", (req, res) => {
   res.json({ active: autoLoopActive, count: autoLoopCount, betAmount: autoLoopBetAmount });
 });
 
-// ========== KONFIGURASI UNTUK FRONTEND ==========
+// Konfigurasi untuk frontend
 app.get("/api/config", (req, res) => {
   res.json({
     treasuryAddress,
@@ -431,21 +420,24 @@ app.get("/api/config", (req, res) => {
   });
 });
 
-// ========== LISTENER CX1 TRANSFERS ==========
+// ========== LISTENER CX1 ==========
 async function setupEventListener() {
-  // Filter Transfer events where 'to' is treasuryAddress
-  const filter = cx1.filters.Transfer(null, treasuryAddress);
-  cx1.on(filter, async (from, to, value, event) => {
-    try {
-      await handleCX1Transfer(from, to, value, event);
-    } catch (err) {
-      console.error("Error handling Transfer event:", err.message);
-    }
-  });
-  console.log("Listening for CX1 transfers...");
+  try {
+    const filter = cx1.filters.Transfer(null, treasuryAddress);
+    cx1.on(filter, async (from, to, value, event) => {
+      try {
+        await handleCX1Transfer(from, to, value, event);
+      } catch (err) {
+        console.error("Error handling Transfer event:", err.message);
+      }
+    });
+    console.log("Listening for CX1 transfers...");
+  } catch (err) {
+    console.error("Failed to setup CX1 event listener:", err.message);
+  }
 }
 
-// ========== CHECK ALL ROOMS (saat start) ==========
+// ========== CHECK ALL ROOMS ==========
 async function checkAllRooms() {
   for (const roomId of Object.keys(rooms)) {
     checkRoomCompletion(parseInt(roomId));
@@ -467,9 +459,19 @@ async function main() {
   await checkAllRooms();
   await setupEventListener();
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(player1 && player2 ? "✅ Auto-game & Auto-loop ready" : "⚠️  Player wallets not set. Auto modes disabled.");
+  });
+
+  // Graceful shutdown
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down...');
+    server.close(() => {
+      console.log('HTTP server closed');
+      cx1.removeAllListeners();
+      process.exit(0);
+    });
   });
 }
 
