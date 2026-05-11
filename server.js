@@ -147,6 +147,7 @@ async function refundRoom(roomId) {
 async function processIncomingTransaction(tx) {
   if (processedTxs.has(tx.hash)) return;
   processedTxs.add(tx.hash);
+  if (!tx.to) return;
   if (tx.to.toLowerCase() !== treasuryAddress.toLowerCase()) return;
 
   let roomId;
