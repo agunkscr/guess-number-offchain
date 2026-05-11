@@ -44,8 +44,9 @@ const cx1 = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, provider);
 
 // ========== STATE ==========
 let rooms = {};
-let processedTxs = new Set();
+let processedTxs = new Set(); // tetap dipakai untuk cegah duplikat dalam memori
 let roomCounter = 0;
+let lastCheckedBlock = 0;
 
 // Auto-loop
 let autoLoopActive = false;
@@ -65,10 +66,12 @@ async function loadData() {
     rooms = data.rooms || {};
     roomCounter = data.roomCounter || 0;
     processedTxs = new Set(data.processedTxs || []);
+    lastCheckedBlock = data.lastCheckedBlock || 0;
   } catch {
     rooms = {};
     roomCounter = 0;
     processedTxs = new Set();
+    lastCheckedBlock = 0;
   }
 }
 
@@ -77,6 +80,7 @@ async function saveData() {
     rooms,
     roomCounter,
     processedTxs: Array.from(processedTxs),
+    lastCheckedBlock,
   }, null, 2));
 }
 
@@ -159,7 +163,7 @@ async function refundRoom(roomId) {
   await saveData();
 }
 
-// Deteksi Transfer CX1 dari pemain ke treasury
+// Deteksi Transfer CX1 dari pemain ke treasury (dipanggil dari polling)
 async function handleCX1Transfer(from, to, value, event) {
   const txHash = event.transactionHash;
   if (processedTxs.has(txHash)) return;
@@ -184,6 +188,37 @@ async function handleCX1Transfer(from, to, value, event) {
     await saveData();
     checkRoomCompletion(parseInt(roomId));
     break;
+  }
+}
+
+// ========== POLLING LOG CX1 ==========
+async function pollCX1Transfers() {
+  try {
+    const currentBlock = await provider.getBlockNumber();
+    if (lastCheckedBlock === 0) {
+      // Pertama kali, mulai dari block saat ini (abaikan log lama)
+      lastCheckedBlock = currentBlock;
+      await saveData();
+      return;
+    }
+    if (currentBlock <= lastCheckedBlock) return;
+
+    const filter = cx1.filters.Transfer(null, treasuryAddress);
+    const logs = await provider.getLogs({
+      ...filter,
+      fromBlock: lastCheckedBlock + 1,
+      toBlock: currentBlock,
+    });
+
+    for (const log of logs) {
+      const parsed = cx1.interface.parseLog(log);
+      await handleCX1Transfer(parsed.args.from, parsed.args.to, parsed.args.value, log);
+    }
+
+    lastCheckedBlock = currentBlock;
+    await saveData();
+  } catch (err) {
+    console.error("Polling CX1 error:", err.message);
   }
 }
 
@@ -230,7 +265,9 @@ async function autoPlayRoom(betAmount, secretNumber) {
 
   await Promise.all([sendCX1(player1, player1.address), sendCX1(player2, player2.address)]);
   console.log(`Both CX1 payments confirmed for room ${roomId}`);
-  await new Promise(r => setTimeout(r, 2000));
+  // Biarkan polling yang mendeteksi pembayaran – kita tunggu beberapa detik lalu paksa cek
+  await new Promise(r => setTimeout(r, 5000));
+  await pollCX1Transfers(); // langsung cek log agar cepat
   await checkRoomCompletion(roomId);
   return rooms[roomId];
 }
@@ -363,7 +400,9 @@ app.get("/api/leaderboard", (req, res) => {
       wins[room.winner] = (wins[room.winner] || 0) + 1;
     }
   }
-  const sorted = Object.entries(wins).map(([wallet, count]) => ({ wallet, wins: count })).sort((a, b) => b.wins - a.wins);
+  const sorted = Object.entries(wins)
+    .map(([wallet, count]) => ({ wallet, wins: count }))
+    .sort((a, b) => b.wins - a.wins);
   res.json(sorted);
 });
 
@@ -383,13 +422,21 @@ app.get("/api/transactions", (req, res) => {
   res.json(txs);
 });
 
-// Auto game sekali
+// Auto game (sekali)
 app.post("/api/auto-game", requireAdmin, async (req, res) => {
   const { betAmount = "0.01", secretNumber } = req.body;
   if (isNaN(parseFloat(betAmount)) || parseFloat(betAmount) <= 0) return res.status(400).json({ error: "Invalid betAmount" });
   try {
     const room = await autoPlayRoom(betAmount, secretNumber || undefined);
-    res.json({ message: "Auto game completed", roomId: room.id, status: room.status, secretNumber: room.secretNumber, winner: room.winner || "none", players: room.players.map(p => ({ wallet: p.wallet, guess: p.guess, status: p.status })), payoutTx: room.payoutTx });
+    res.json({
+      message: "Auto game completed",
+      roomId: room.id,
+      status: room.status,
+      secretNumber: room.secretNumber,
+      winner: room.winner || "none",
+      players: room.players.map(p => ({ wallet: p.wallet, guess: p.guess, status: p.status })),
+      payoutTx: room.payoutTx,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -420,23 +467,6 @@ app.get("/api/config", (req, res) => {
   });
 });
 
-// ========== LISTENER CX1 ==========
-async function setupEventListener() {
-  try {
-    const filter = cx1.filters.Transfer(null, treasuryAddress);
-    cx1.on(filter, async (from, to, value, event) => {
-      try {
-        await handleCX1Transfer(from, to, value, event);
-      } catch (err) {
-        console.error("Error handling Transfer event:", err.message);
-      }
-    });
-    console.log("Listening for CX1 transfers...");
-  } catch (err) {
-    console.error("Failed to setup CX1 event listener:", err.message);
-  }
-}
-
 // ========== CHECK ALL ROOMS ==========
 async function checkAllRooms() {
   for (const roomId of Object.keys(rooms)) {
@@ -457,19 +487,21 @@ async function main() {
   }
 
   await checkAllRooms();
-  await setupEventListener();
+
+  // Polling CX1 setiap 10 detik
+  setInterval(pollCX1Transfers, 10000);
+  // Jalankan satu kali langsung saat start
+  pollCX1Transfers().catch(console.error);
 
   const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(player1 && player2 ? "✅ Auto-game & Auto-loop ready" : "⚠️  Player wallets not set. Auto modes disabled.");
   });
 
-  // Graceful shutdown
   process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down...');
     server.close(() => {
       console.log('HTTP server closed');
-      cx1.removeAllListeners();
       process.exit(0);
     });
   });
