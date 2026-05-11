@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Guess Number – Autheo CX1 (Auto Play)</title>
+  <title>Guess Number – Autheo CX1 (ERC‑20)</title>
   <style>
     body { font-family: Arial; padding: 20px; background: #f9f9f9; }
     .card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; }
@@ -21,27 +21,22 @@
 
   <hr>
 
-  <!-- Admin Panel -->
   <div id="adminSection" style="display:none">
     <h3>Admin Panel</h3>
-    <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password">
-    <br>
+    <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password"><br>
     <input id="maxPlayers" type="number" min="2" value="2" placeholder="Max Players">
     <input id="betAmount" placeholder="Bet (CX1)" value="0.01">
     <button onclick="createRoom()">Buat Room Manual</button>
     <button onclick="autoGame()" style="background:#e67e22;">⚡ Auto Game (sekali)</button>
-
-    <hr style="margin-top:15px;">
+    <hr>
     <button onclick="startAutoLoop()" style="background:#27ae60;">▶ Mulai Auto-Loop</button>
     <button onclick="stopAutoLoop()" style="background:#c0392b;">⏹ Hentikan Loop</button>
     <span id="loopStatus"></span>
-
     <div id="adminStatus"></div>
   </div>
 
   <h3>📋 Daftar Room</h3>
   <div id="roomList">Loading...</div>
-
   <div id="roomDetail" class="card" style="display:none"></div>
 
   <h3>🏆 Leaderboard</h3>
@@ -49,10 +44,11 @@
 
   <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
   <script>
-    // ⚠️ GANTI DENGAN ALAMAT TREASURY YANG MUNCUL DI LOG SERVER
+    // ⚠️ GANTI dengan alamat treasury & token CX1
     const TREASURY_ADDRESS = "0xC46f340E3923F4363D876E4097E52eF93ff29cE1";
+    const CX1_TOKEN_ADDRESS = "PASTE_CX1_TOKEN_ADDRESS_HERE"; // dari .env
 
-    let provider, signer, account;
+    let provider, signer, account, cx1Contract;
 
     async function connectWallet() {
       if (!window.ethereum) return alert('Install MetaMask!');
@@ -62,6 +58,11 @@
       account = await signer.getAddress();
       document.getElementById('accountDisplay').innerText = `${account.substring(0,10)}...`;
       document.getElementById('adminSection').style.display = 'block';
+
+      // Inisialisasi kontrak CX1 untuk transfer
+      const erc20Abi = ["function transfer(address to, uint256 amount) returns (bool)"];
+      cx1Contract = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, signer);
+
       refreshRooms();
       loadLeaderboard();
     }
@@ -76,7 +77,7 @@
           <div class="card">
             <b>#${r.id}</b> | ${r.status} | Players: ${r.playerCount}/${r.maxPlayers} | Bet: ${r.betAmount} CX1
             <button onclick="showRoomDetail(${r.id})">Detail</button>
-            ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim Taruhan</button>` : ''}
+            ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim CX1</button>` : ''}
           </div>
         `).join('');
       } catch(e) { console.error(e); }
@@ -123,6 +124,7 @@
       if (!account) return alert('Hubungkan wallet dulu!');
       const guess = prompt('Masukkan tebakan (1-10):');
       if (!guess || guess<1 || guess>10) return;
+
       const regRes = await fetch(`/api/rooms/${roomId}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -130,20 +132,20 @@
       });
       const regData = await regRes.json();
       if (!regData.success) return alert(regData.error);
-      alert('Terdaftar! Kirim CX1 via MetaMask.');
+
+      // Kirim CX1 langsung ke treasury
       try {
         const res = await fetch(`/api/rooms/${roomId}`);
         const room = await res.json();
-        const tx = await signer.sendTransaction({
-          to: TREASURY_ADDRESS,
-          value: ethers.utils.parseEther(room.betAmount),
-          data: ethers.utils.hexZeroPad(ethers.utils.hexlify(roomId), 32)
-        });
-        alert('Transaksi dikirim: ' + tx.hash);
+        const betWei = ethers.utils.parseEther(room.betAmount);
+        const tx = await cx1Contract.transfer(TREASURY_ADDRESS, betWei);
+        alert('CX1 dikirim, tx: ' + tx.hash);
         await tx.wait();
-        alert('Taruhan terkonfirmasi!');
+        alert('Transfer terkonfirmasi!');
         refreshRooms();
-      } catch(e) { alert('Gagal: ' + e.message); }
+      } catch(e) {
+        alert('Gagal transfer CX1: ' + e.message);
+      }
     }
 
     // ========== AUTO ==========
@@ -215,8 +217,8 @@
         : 'Belum ada pemenang.';
     }
 
-    // Auto-refresh rooms tiap 5 detik
-    setInterval(()=>{ if(account) { refreshRooms(); loadLeaderboard(); } }, 5000);
+    // Auto refresh
+    setInterval(() => { if (account) { refreshRooms(); loadLeaderboard(); } }, 5000);
   </script>
 </body>
 </html>
