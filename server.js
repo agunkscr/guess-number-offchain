@@ -6,11 +6,11 @@ const path = require("path");
 const { ethers } = require("ethers");
 
 // ========== GLOBAL ERROR HANDLERS ==========
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
 });
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught Exception:', err);
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
 });
 
 // ========== ENV ==========
@@ -48,12 +48,30 @@ try {
   const erc20Abi = [
     "function transfer(address to, uint256 amount) returns (bool)",
     "function balanceOf(address owner) view returns (uint256)",
-    "event Transfer(address indexed from, address indexed to, uint256 value)"
+    "event Transfer(address indexed from, address indexed to, uint256 value)",
   ];
   cx1 = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, provider);
 } catch (err) {
   console.error("Failed to initialize wallets/contract:", err.message);
   process.exit(1);
+}
+
+// ========== HELPERS: BigNumber serialization ==========
+// ethers.BigNumber tidak survive JSON round-trip.
+// Simpan sebagai string hex, load kembali pakai BigNumber.from().
+
+function serializeRoom(room) {
+  return {
+    ...room,
+    betAmountWei: room.betAmountWei.toHexString(),
+  };
+}
+
+function deserializeRoom(room) {
+  return {
+    ...room,
+    betAmountWei: ethers.BigNumber.from(room.betAmountWei),
+  };
 }
 
 // ========== STATE ==========
@@ -69,14 +87,23 @@ let autoLoopCount = 0;
 
 // ========== PERSISTENT STORAGE ==========
 async function initDataDir() {
-  try { await fs.mkdir(DATA_DIR, { recursive: true }); } catch (_) {}
+  try {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  } catch (_) {}
 }
 
 async function loadData() {
   try {
     const raw = await fs.readFile(DATA_FILE, "utf-8");
     const data = JSON.parse(raw);
-    rooms = data.rooms || {};
+
+    // Deserialize BigNumber dari string hex
+    const rawRooms = data.rooms || {};
+    rooms = {};
+    for (const [id, room] of Object.entries(rawRooms)) {
+      rooms[id] = deserializeRoom(room);
+    }
+
     roomCounter = data.roomCounter || 0;
     processedTxs = new Set(data.processedTxs || []);
     lastCheckedBlock = data.lastCheckedBlock || 0;
@@ -89,25 +116,39 @@ async function loadData() {
 }
 
 async function saveData() {
-  await fs.writeFile(DATA_FILE, JSON.stringify({
-    rooms,
-    roomCounter,
-    processedTxs: Array.from(processedTxs),
-    lastCheckedBlock,
-  }, null, 2));
+  // Serialize BigNumber ke string hex sebelum disimpan
+  const serializedRooms = {};
+  for (const [id, room] of Object.entries(rooms)) {
+    serializedRooms[id] = serializeRoom(room);
+  }
+
+  await fs.writeFile(
+    DATA_FILE,
+    JSON.stringify(
+      {
+        rooms: serializedRooms,
+        roomCounter,
+        processedTxs: Array.from(processedTxs),
+        lastCheckedBlock,
+      },
+      null,
+      2
+    )
+  );
 }
 
 // ========== LOGIKA GAME ==========
-function checkRoomCompletion(roomId) {
+// FIX: dibuat async agar resolveRoom/refundRoom bisa di-await dengan benar
+async function checkRoomCompletion(roomId) {
   const room = rooms[roomId];
   if (!room || room.status !== "waiting") return;
   const now = Date.now();
-  const allPaid = room.players.every(p => p.status === "paid");
+  const allPaid = room.players.every((p) => p.status === "paid");
   const isFull = room.players.length >= room.maxPlayers;
   const deadlinePassed = now >= room.deadline;
 
-  if (allPaid && isFull) resolveRoom(roomId);
-  else if (deadlinePassed) refundRoom(roomId);
+  if (allPaid && isFull) await resolveRoom(roomId);
+  else if (deadlinePassed) await refundRoom(roomId);
 }
 
 async function resolveRoom(roomId) {
@@ -116,40 +157,51 @@ async function resolveRoom(roomId) {
   room.status = "processing";
   console.log(`Resolving room ${roomId}...`);
 
-  const paidPlayers = room.players.filter(p => p.status === "paid");
-  const winners = paidPlayers.filter(p => p.guess === room.secretNumber);
+  const paidPlayers = room.players.filter((p) => p.status === "paid");
+  const winners = paidPlayers.filter((p) => p.guess === room.secretNumber);
 
   if (winners.length > 0) {
     const winner = winners[0];
-    const totalPot = paidPlayers.reduce((sum, p) => sum + room.betAmountWei, 0n);
+
+    // FIX: gunakan BigNumber.add() bukan native BigInt 0n
+    const totalPot = paidPlayers.reduce(
+      (sum, _p) => sum.add(room.betAmountWei),
+      ethers.BigNumber.from(0)
+    );
+
     try {
       const tx = await cx1.connect(wallet).transfer(winner.wallet, totalPot);
       await tx.wait();
       room.winner = winner.wallet;
       room.payoutTx = tx.hash;
-      console.log(`Winner ${winner.wallet} paid ${ethers.utils.formatEther(totalPot)} CX1`);
+      room.status = "revealed";
+      room.resolvedAt = Date.now();
+      console.log(
+        `Winner ${winner.wallet} paid ${ethers.utils.formatEther(totalPot)} CX1`
+      );
     } catch (err) {
       console.error(`Payout failed:`, err.message);
-      room.status = "waiting";
+      room.status = "waiting"; // rollback agar bisa retry
       return;
     }
   } else {
-    try {
-      for (const p of paidPlayers) {
+    // Tidak ada pemenang → refund semua
+    let refundFailed = false;
+    for (const p of paidPlayers) {
+      try {
         const tx = await cx1.connect(wallet).transfer(p.wallet, room.betAmountWei);
         await tx.wait();
         p.refundTx = tx.hash;
+      } catch (err) {
+        console.error(`Refund failed for ${p.wallet}:`, err.message);
+        refundFailed = true;
       }
-      room.status = "refunded";
-    } catch (err) {
-      console.error(`Refund failed:`, err.message);
-      room.status = "waiting";
-      return;
     }
+    // FIX: jangan override status dengan "revealed" jika ini path refund
+    room.status = refundFailed ? "refund_partial" : "refunded";
+    room.resolvedAt = Date.now();
   }
 
-  room.status = "revealed";
-  room.resolvedAt = Date.now();
   await saveData();
 }
 
@@ -157,8 +209,11 @@ async function refundRoom(roomId) {
   const room = rooms[roomId];
   if (room.status !== "waiting") return;
   room.status = "refunding";
-  console.log(`Refunding room ${roomId}...`);
-  const paidPlayers = room.players.filter(p => p.status === "paid");
+  console.log(`Refunding room ${roomId} (deadline passed)...`);
+
+  const paidPlayers = room.players.filter((p) => p.status === "paid");
+  let refundFailed = false;
+
   for (const p of paidPlayers) {
     try {
       const tx = await cx1.connect(wallet).transfer(p.wallet, room.betAmountWei);
@@ -166,9 +221,11 @@ async function refundRoom(roomId) {
       p.refundTx = tx.hash;
     } catch (err) {
       console.error(`Refund failed for ${p.wallet}:`, err.message);
+      refundFailed = true;
     }
   }
-  room.status = "refunded";
+
+  room.status = refundFailed ? "refund_partial" : "refunded";
   room.resolvedAt = Date.now();
   await saveData();
 }
@@ -183,19 +240,27 @@ async function handleCX1Transfer(from, to, value, event) {
   for (const roomId of Object.keys(rooms)) {
     const room = rooms[roomId];
     if (room.status !== "waiting") continue;
+
     const player = room.players.find(
-      p => p.wallet.toLowerCase() === from.toLowerCase() && p.status === "registered"
+      (p) =>
+        p.wallet.toLowerCase() === from.toLowerCase() &&
+        p.status === "registered"
     );
     if (!player) continue;
+
+    // FIX: room.betAmountWei sekarang dijamin BigNumber (via deserializeRoom)
     if (value.lt(room.betAmountWei)) {
       console.log(`Insufficient CX1 from ${from}`);
       continue;
     }
+
     player.status = "paid";
     player.txHash = txHash;
-    console.log(`Player ${from} paid ${ethers.utils.formatEther(value)} CX1`);
+    console.log(
+      `Player ${from} paid ${ethers.utils.formatEther(value)} CX1 for room ${roomId}`
+    );
     await saveData();
-    checkRoomCompletion(parseInt(roomId));
+    await checkRoomCompletion(parseInt(roomId));
     break;
   }
 }
@@ -220,7 +285,12 @@ async function pollCX1Transfers() {
 
     for (const log of logs) {
       const parsed = cx1.interface.parseLog(log);
-      await handleCX1Transfer(parsed.args.from, parsed.args.to, parsed.args.value, log);
+      await handleCX1Transfer(
+        parsed.args.from,
+        parsed.args.to,
+        parsed.args.value,
+        log
+      );
     }
 
     lastCheckedBlock = currentBlock;
@@ -233,6 +303,7 @@ async function pollCX1Transfers() {
 // ========== AUTO GAME ==========
 async function autoPlayRoom(betAmount, secretNumber) {
   if (!player1 || !player2) throw new Error("Player wallets not set.");
+
   roomCounter++;
   const roomId = roomCounter;
   const actualNumber = secretNumber || Math.floor(Math.random() * 10) + 1;
@@ -260,16 +331,25 @@ async function autoPlayRoom(betAmount, secretNumber) {
   room.players.push({ wallet: player2.address, guess: guess2, status: "registered" });
   await saveData();
 
-  const sendCX1 = async (playerWallet, addr) => {
+  const sendCX1 = async (playerWallet, label) => {
     const tx = await cx1.connect(playerWallet).transfer(treasuryAddress, betWei);
     await tx.wait();
-    console.log(`${addr} CX1 transfer confirmed`);
+    console.log(`${label} CX1 transfer confirmed`);
   };
 
-  await Promise.all([sendCX1(player1, player1.address), sendCX1(player2, player2.address)]);
-  await new Promise(r => setTimeout(r, 5000));
+  await Promise.all([
+    sendCX1(player1, player1.address),
+    sendCX1(player2, player2.address),
+  ]);
+
+  // Tunggu beberapa detik biar block ter-mine
+  await new Promise((r) => setTimeout(r, 5000));
   await pollCX1Transfers();
+
+  // FIX: checkRoomCompletion sekarang async, di-await agar room benar-benar selesai
+  // sebelum return ke caller
   await checkRoomCompletion(roomId);
+
   return rooms[roomId];
 }
 
@@ -311,31 +391,232 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-// Middleware logging untuk debug healthcheck
 app.use((req, res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
   next();
 });
 
 function requireAdmin(req, res, next) {
-  if (req.headers["x-api-key"] !== ADMIN_API_KEY) return res.status(403).json({ error: "Forbidden" });
+  if (req.headers["x-api-key"] !== ADMIN_API_KEY)
+    return res.status(403).json({ error: "Forbidden" });
   next();
 }
 
-// Health-check root
-app.get("/", (req, res) => {
+// ========== ENDPOINTS ==========
+
+// Health check
+app.get("/health", (req, res) => {
   res.json({ status: "ok", uptime: process.uptime() });
 });
 
-// === endpoint lain sama seperti sebelumnya ===
-app.post("/api/rooms", requireAdmin, async (req, res) => { ... });
-// ... (semua endpoint yang sudah ada) ...
-app.get("/api/config", (req, res) => { ... });
+// Config publik untuk frontend
+app.get("/api/config", (req, res) => {
+  res.json({
+    treasuryAddress,
+    cx1TokenAddress: CX1_TOKEN_ADDRESS,
+  });
+});
+
+// List semua rooms (tanpa secretNumber)
+app.get("/api/rooms", (req, res) => {
+  const list = Object.values(rooms).map((r) => ({
+    id: r.id,
+    status: r.status,
+    maxPlayers: r.maxPlayers,
+    playerCount: r.players.length,
+    betAmount: r.betAmount,
+    deadline: r.deadline,
+    createdAt: r.createdAt,
+    winner: r.winner || null,
+  }));
+  // Urutkan terbaru di atas
+  list.sort((a, b) => b.id - a.id);
+  res.json(list);
+});
+
+// Detail satu room
+app.get("/api/rooms/:id", (req, res) => {
+  const room = rooms[parseInt(req.params.id)];
+  if (!room) return res.status(404).json({ error: "Room not found" });
+
+  const isResolved = ["revealed", "refunded", "refund_partial"].includes(room.status);
+
+  res.json({
+    id: room.id,
+    status: room.status,
+    maxPlayers: room.maxPlayers,
+    betAmount: room.betAmount,
+    deadline: room.deadline,
+    createdAt: room.createdAt,
+    resolvedAt: room.resolvedAt || null,
+    winner: room.winner || null,
+    payoutTx: room.payoutTx || null,
+    // Angka rahasia hanya ditampilkan setelah selesai
+    secretNumber: isResolved ? room.secretNumber : undefined,
+    players: room.players.map((p) => ({
+      wallet: p.wallet,
+      guess: isResolved ? p.guess : undefined,
+      status: p.status,
+      txHash: p.txHash || null,
+      refundTx: p.refundTx || null,
+    })),
+  });
+});
+
+// Buat room baru (manual, admin only)
+app.post("/api/rooms", requireAdmin, async (req, res) => {
+  try {
+    const maxPlayers = parseInt(req.body.maxPlayers) || 2;
+    const betAmount = req.body.betAmount || "0.01";
+
+    if (maxPlayers < 2 || maxPlayers > 10)
+      return res.status(400).json({ error: "maxPlayers harus antara 2-10" });
+
+    const betWei = ethers.utils.parseEther(betAmount);
+    const secretNumber = Math.floor(Math.random() * 10) + 1;
+
+    roomCounter++;
+    const roomId = roomCounter;
+
+    rooms[roomId] = {
+      id: roomId,
+      secretNumber,
+      maxPlayers,
+      betAmountWei: betWei,
+      betAmount,
+      deadline: Date.now() + 600000, // 10 menit
+      status: "waiting",
+      players: [],
+      createdAt: Date.now(),
+    };
+
+    await saveData();
+    console.log(`Room ${roomId} created, secret: ${secretNumber}`);
+    res.json({ roomId, treasuryAddress, betAmount, deadline: rooms[roomId].deadline });
+  } catch (err) {
+    console.error("Create room error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Daftar ke room
+app.post("/api/rooms/:id/register", async (req, res) => {
+  try {
+    const roomId = parseInt(req.params.id);
+    const { wallet: playerWallet, guess } = req.body;
+
+    if (!playerWallet || !ethers.utils.isAddress(playerWallet))
+      return res.status(400).json({ error: "Wallet address tidak valid" });
+
+    const guessNum = parseInt(guess);
+    if (!guessNum || guessNum < 1 || guessNum > 10)
+      return res.status(400).json({ error: "Tebakan harus angka 1-10" });
+
+    const room = rooms[roomId];
+    if (!room) return res.status(404).json({ error: "Room tidak ditemukan" });
+    if (room.status !== "waiting")
+      return res.status(400).json({ error: "Room sudah tidak aktif" });
+    if (room.players.length >= room.maxPlayers)
+      return res.status(400).json({ error: "Room sudah penuh" });
+    if (Date.now() >= room.deadline)
+      return res.status(400).json({ error: "Deadline sudah lewat" });
+
+    const alreadyIn = room.players.find(
+      (p) => p.wallet.toLowerCase() === playerWallet.toLowerCase()
+    );
+    if (alreadyIn)
+      return res.status(400).json({ error: "Wallet sudah terdaftar di room ini" });
+
+    room.players.push({
+      wallet: playerWallet,
+      guess: guessNum,
+      status: "registered",
+    });
+
+    await saveData();
+    res.json({
+      success: true,
+      treasuryAddress,
+      betAmount: room.betAmount,
+      message: `Berhasil daftar. Kirim ${room.betAmount} CX1 ke ${treasuryAddress} untuk konfirmasi.`,
+    });
+  } catch (err) {
+    console.error("Register error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Auto game sekali (admin only)
+app.post("/api/auto-game", requireAdmin, async (req, res) => {
+  try {
+    const betAmount = req.body.betAmount || "0.01";
+    const result = await autoPlayRoom(betAmount, undefined);
+    res.json({
+      roomId: result.id,
+      status: result.status,
+      winner: result.winner || null,
+      secretNumber: result.secretNumber,
+      players: result.players.map((p) => ({
+        wallet: p.wallet,
+        guess: p.guess,
+        status: p.status,
+      })),
+    });
+  } catch (err) {
+    console.error("Auto game error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start auto loop (admin only)
+app.post("/api/auto-loop/start", requireAdmin, async (req, res) => {
+  try {
+    if (autoLoopActive)
+      return res.status(400).json({ error: "Loop sudah berjalan" });
+    const betAmount = req.body.betAmount || "0.01";
+    await startAutoLoop(betAmount);
+    res.json({ success: true, message: "Auto-loop dimulai", betAmount });
+  } catch (err) {
+    console.error("Auto-loop start error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Stop auto loop (admin only)
+app.post("/api/auto-loop/stop", requireAdmin, (req, res) => {
+  stopAutoLoop();
+  res.json({ success: true, message: "Auto-loop dihentikan" });
+});
+
+// Status auto loop
+app.get("/api/auto-loop/status", (req, res) => {
+  res.json({
+    active: autoLoopActive,
+    count: autoLoopCount,
+    betAmount: autoLoopBetAmount,
+  });
+});
+
+// Leaderboard
+app.get("/api/leaderboard", (req, res) => {
+  const wins = {};
+  for (const room of Object.values(rooms)) {
+    if (room.winner) {
+      const addr = room.winner.toLowerCase();
+      wins[addr] = (wins[addr] || 0) + 1;
+    }
+  }
+  const leaderboard = Object.entries(wins)
+    .map(([wallet, count]) => ({ wallet, wins: count }))
+    .sort((a, b) => b.wins - a.wins)
+    .slice(0, 20);
+  res.json(leaderboard);
+});
 
 // ========== CHECK ALL ROOMS ==========
 async function checkAllRooms() {
   for (const roomId of Object.keys(rooms)) {
-    checkRoomCompletion(parseInt(roomId));
+    await checkRoomCompletion(parseInt(roomId));
   }
 }
 
@@ -344,10 +625,9 @@ async function main() {
   await initDataDir();
   await loadData();
 
-  // Pastikan provider siap
   try {
-    await provider.getBlockNumber();
-    console.log("RPC connected, current block:", await provider.getBlockNumber());
+    const block = await provider.getBlockNumber();
+    console.log("RPC connected, current block:", block);
   } catch (e) {
     console.error("RPC connection failed:", e.message);
     process.exit(1);
@@ -355,19 +635,17 @@ async function main() {
 
   await checkAllRooms();
 
-  // Polling setiap 10 detik
   setInterval(pollCX1Transfers, 10000);
-  // Jalankan sekali di awal dengan delay agar tidak ganggu server startup
   setTimeout(() => pollCX1Transfers().catch(console.error), 1000);
 
   const server = app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
   });
 
-  process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down...');
+  process.on("SIGTERM", () => {
+    console.log("SIGTERM received, shutting down...");
     server.close(() => {
-      console.log('HTTP server closed');
+      console.log("HTTP server closed");
       process.exit(0);
     });
   });
