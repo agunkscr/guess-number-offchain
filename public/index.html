@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <title>Guess Number – Autheo CX1 (ERC‑20)</title>
   <style>
-    body { font-family: Arial; padding: 20px; background: #f9f9f9; }
+    body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
     .card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; }
     button { cursor: pointer; padding: 8px 12px; margin: 4px; border: none; border-radius: 4px; background: #4a90d9; color: white; }
     button:hover { background: #357abd; }
     input, select { padding: 6px; margin: 4px; }
     .error { color: red; }
     .success { color: green; }
-    pre { background: #eee; padding: 10px; }
+    pre { background: #eee; padding: 10px; overflow-x: auto; }
   </style>
 </head>
 <body>
@@ -25,7 +25,7 @@
     <h3>Admin Panel</h3>
     <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password"><br>
     <input id="maxPlayers" type="number" min="2" value="2" placeholder="Max Players">
-    <input id="betAmount" placeholder="Bet (CX1)" value="0.01">
+    <input id="betAmount" placeholder="Taruhan (CX1)" value="0.01">
     <button onclick="createRoom()">Buat Room Manual</button>
     <button onclick="autoGame()" style="background:#e67e22;">⚡ Auto Game (sekali)</button>
     <hr>
@@ -44,10 +44,27 @@
 
   <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
   <script>
-    // ⚠️ GANTI dengan alamat treasury & token CX1
-    const TREASURY_ADDRESS = "0xC46f340E3923F4363D876E4097E52eF93ff29cE1";
-    const CX1_TOKEN_ADDRESS = "PASTE_CX1_TOKEN_ADDRESS_HERE"; // dari .env
+    // ========== KONFIGURASI DARI SERVER ==========
+    let TREASURY_ADDRESS = "";
+    let CX1_TOKEN_ADDRESS = "";
 
+    async function fetchConfig() {
+      try {
+        const res = await fetch('/api/config');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const config = await res.json();
+        TREASURY_ADDRESS = config.treasuryAddress;
+        CX1_TOKEN_ADDRESS = config.cx1TokenAddress;
+        console.log("Config loaded:", { TREASURY_ADDRESS, CX1_TOKEN_ADDRESS });
+      } catch (e) {
+        console.error("Gagal mengambil config:", e);
+        document.getElementById('roomList').innerHTML = '<span class="error">Gagal memuat konfigurasi server.</span>';
+      }
+    }
+    // Panggil langsung
+    fetchConfig();
+
+    // ========== STATE WALLET ==========
     let provider, signer, account, cx1Contract;
 
     async function connectWallet() {
@@ -59,7 +76,12 @@
       document.getElementById('accountDisplay').innerText = `${account.substring(0,10)}...`;
       document.getElementById('adminSection').style.display = 'block';
 
-      // Inisialisasi kontrak CX1 untuk transfer
+      // Pastikan alamat token CX1 sudah terisi
+      if (!CX1_TOKEN_ADDRESS) {
+        await fetchConfig();
+        if (!CX1_TOKEN_ADDRESS) return alert('Gagal memuat alamat token CX1.');
+      }
+
       const erc20Abi = ["function transfer(address to, uint256 amount) returns (bool)"];
       cx1Contract = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, signer);
 
@@ -67,12 +89,16 @@
       loadLeaderboard();
     }
 
+    // ========== ROOMS ==========
     async function refreshRooms() {
       try {
         const res = await fetch('/api/rooms');
         const rooms = await res.json();
         const container = document.getElementById('roomList');
-        if (!rooms.length) { container.innerHTML = '<p>Belum ada room.</p>'; return; }
+        if (!rooms.length) {
+          container.innerHTML = '<p>Belum ada room.</p>';
+          return;
+        }
         container.innerHTML = rooms.map(r => `
           <div class="card">
             <b>#${r.id}</b> | ${r.status} | Players: ${r.playerCount}/${r.maxPlayers} | Bet: ${r.betAmount} CX1
@@ -80,26 +106,28 @@
             ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim CX1</button>` : ''}
           </div>
         `).join('');
-      } catch(e) { console.error(e); }
+      } catch (e) { console.error(e); }
     }
 
     async function showRoomDetail(roomId) {
-      const res = await fetch(`/api/rooms/${roomId}`);
-      const room = await res.json();
-      const div = document.getElementById('roomDetail');
-      div.style.display = 'block';
-      div.innerHTML = `
-        <h4>Room #${room.id}</h4>
-        <p>Status: <b>${room.status}</b> | Deadline: ${new Date(room.deadline).toLocaleString()}</p>
-        <p>Taruhan: ${room.betAmount} CX1</p>
-        ${room.secretNumber !== undefined ? `<p>Angka rahasia: <b>${room.secretNumber}</b></p>` : ''}
-        <p>Pemenang: ${room.winner || '-'}</p>
-        <h5>Pemain:</h5>
-        <ul>${room.players.map(p => `<li>${p.wallet.substring(0,8)}... - Tebak: ${p.guess ?? '?'} - Status: ${p.status}</li>`).join('')}</ul>
-      `;
+      try {
+        const res = await fetch(`/api/rooms/${roomId}`);
+        const room = await res.json();
+        const div = document.getElementById('roomDetail');
+        div.style.display = 'block';
+        div.innerHTML = `
+          <h4>Room #${room.id}</h4>
+          <p>Status: <b>${room.status}</b> | Deadline: ${new Date(room.deadline).toLocaleString()}</p>
+          <p>Taruhan: ${room.betAmount} CX1</p>
+          ${room.secretNumber !== undefined ? `<p>Angka rahasia: <b>${room.secretNumber}</b></p>` : ''}
+          <p>Pemenang: ${room.winner || '-'}</p>
+          <h5>Pemain:</h5>
+          <ul>${room.players.map(p => `<li>${p.wallet.substring(0,8)}... - Tebak: ${p.guess ?? '?'} - Status: ${p.status}</li>`).join('')}</ul>
+        `;
+      } catch (e) { console.error(e); }
     }
 
-    // ========== MANUAL ==========
+    // ========== MANUAL MODE ==========
     async function createRoom() {
       const apiKey = document.getElementById('apiKey').value;
       const maxPlayers = document.getElementById('maxPlayers').value;
@@ -111,29 +139,32 @@
           body: JSON.stringify({ maxPlayers, betAmount })
         });
         const data = await res.json();
+        const statusDiv = document.getElementById('adminStatus');
         if (data.roomId) {
-          document.getElementById('adminStatus').innerHTML = `<span class="success">Room ${data.roomId} dibuat. Treasury: ${data.treasuryAddress}</span>`;
+          statusDiv.innerHTML = `<span class="success">Room ${data.roomId} dibuat. Treasury: ${data.treasuryAddress}</span>`;
           refreshRooms();
         } else {
-          document.getElementById('adminStatus').innerHTML = `<span class="error">Error: ${data.error}</span>`;
+          statusDiv.innerHTML = `<span class="error">Error: ${data.error}</span>`;
         }
-      } catch(e) { console.error(e); }
+      } catch (e) { console.error(e); }
     }
 
     async function registerPlayer(roomId) {
       if (!account) return alert('Hubungkan wallet dulu!');
+      if (!cx1Contract) return alert('Token CX1 belum diinisialisasi.');
       const guess = prompt('Masukkan tebakan (1-10):');
-      if (!guess || guess<1 || guess>10) return;
+      if (!guess || guess < 1 || guess > 10) return;
 
+      // Daftarkan ke server
       const regRes = await fetch(`/api/rooms/${roomId}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ wallet: account, guess: parseInt(guess) })
       });
       const regData = await regRes.json();
-      if (!regData.success) return alert(regData.error);
+      if (!regData.success) return alert('Gagal daftar: ' + regData.error);
 
-      // Kirim CX1 langsung ke treasury
+      // Kirim CX1 ke treasury
       try {
         const res = await fetch(`/api/rooms/${roomId}`);
         const room = await res.json();
@@ -141,17 +172,19 @@
         const tx = await cx1Contract.transfer(TREASURY_ADDRESS, betWei);
         alert('CX1 dikirim, tx: ' + tx.hash);
         await tx.wait();
-        alert('Transfer terkonfirmasi!');
+        alert('Transfer CX1 terkonfirmasi!');
         refreshRooms();
-      } catch(e) {
+      } catch (e) {
         alert('Gagal transfer CX1: ' + e.message);
       }
     }
 
-    // ========== AUTO ==========
+    // ========== AUTO MODE (SEKALI) ==========
     async function autoGame() {
       const apiKey = document.getElementById('apiKey').value;
       const betAmount = document.getElementById('betAmount').value;
+      const statusDiv = document.getElementById('adminStatus');
+      statusDiv.innerHTML = 'Auto game berjalan...';
       try {
         const res = await fetch('/api/auto-game', {
           method: 'POST',
@@ -159,10 +192,16 @@
           body: JSON.stringify({ betAmount })
         });
         const data = await res.json();
-        document.getElementById('adminStatus').innerHTML = `<span class="success">Auto game selesai! Room #${data.roomId} - ${data.status}</span>`;
+        if (data.error) {
+          statusDiv.innerHTML = `<span class="error">${data.error}</span>`;
+          return;
+        }
+        statusDiv.innerHTML = `<span class="success">Auto game selesai! Room #${data.roomId} - ${data.status}. Winner: ${data.winner || 'none'}</span>`;
         refreshRooms();
         loadLeaderboard();
-      } catch(e) { console.error(e); }
+      } catch (e) {
+        statusDiv.innerHTML = `<span class="error">Gagal: ${e.message}</span>`;
+      }
     }
 
     // ========== AUTO LOOP ==========
@@ -170,6 +209,7 @@
       const apiKey = document.getElementById('apiKey').value;
       const betAmount = document.getElementById('betAmount').value;
       const statusEl = document.getElementById('loopStatus');
+      statusEl.innerText = 'Memulai...';
       try {
         const res = await fetch('/api/auto-loop/start', {
           method: 'POST',
@@ -177,14 +217,21 @@
           body: JSON.stringify({ betAmount })
         });
         const data = await res.json();
-        statusEl.innerText = data.error ? 'Error: ' + data.error : 'Loop berjalan...';
-        if (!data.error) monitorLoopStatus();
-      } catch(e) { console.error(e); }
+        if (data.error) {
+          statusEl.innerText = 'Error: ' + data.error;
+          return;
+        }
+        statusEl.innerText = 'Loop berjalan...';
+        monitorLoopStatus();
+      } catch (e) {
+        statusEl.innerText = 'Gagal: ' + e.message;
+      }
     }
 
     async function stopAutoLoop() {
       const apiKey = document.getElementById('apiKey').value;
       const statusEl = document.getElementById('loopStatus');
+      statusEl.innerText = 'Menghentikan...';
       try {
         const res = await fetch('/api/auto-loop/stop', {
           method: 'POST',
@@ -192,33 +239,50 @@
         });
         const data = await res.json();
         statusEl.innerText = 'Loop dihentikan.';
-      } catch(e) { console.error(e); }
+      } catch (e) {
+        statusEl.innerText = 'Gagal: ' + e.message;
+      }
     }
 
     async function monitorLoopStatus() {
       const statusEl = document.getElementById('loopStatus');
       const interval = setInterval(async () => {
-        const res = await fetch('/api/auto-loop/status');
-        const data = await res.json();
-        if (!data.active) {
-          statusEl.innerText = `Berhenti. Total game: ${data.count}`;
-          clearInterval(interval);
-        } else {
-          statusEl.innerText = `Game #${data.count}... (taruhan ${data.betAmount})`;
+        try {
+          const res = await fetch('/api/auto-loop/status');
+          const data = await res.json();
+          if (!data.active) {
+            statusEl.innerText = `Berhenti. Total game: ${data.count}`;
+            clearInterval(interval);
+          } else {
+            statusEl.innerText = `Game #${data.count}... (taruhan ${data.betAmount})`;
+          }
+        } catch (e) {
+          console.error(e);
         }
       }, 2000);
     }
 
+    // ========== LEADERBOARD ==========
     async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard');
-      const data = await res.json();
-      document.getElementById('leaderboard').innerText = data.length
-        ? data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n')
-        : 'Belum ada pemenang.';
+      try {
+        const res = await fetch('/api/leaderboard');
+        const data = await res.json();
+        const pre = document.getElementById('leaderboard');
+        if (!data.length) {
+          pre.innerText = 'Belum ada pemenang.';
+          return;
+        }
+        pre.innerText = data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n');
+      } catch (e) { console.error(e); }
     }
 
-    // Auto refresh
-    setInterval(() => { if (account) { refreshRooms(); loadLeaderboard(); } }, 5000);
+    // Auto-refresh rooms & leaderboard setiap 5 detik (jika wallet sudah terhubung)
+    setInterval(() => {
+      if (account) {
+        refreshRooms();
+        loadLeaderboard();
+      }
+    }, 5000);
   </script>
 </body>
 </html>
