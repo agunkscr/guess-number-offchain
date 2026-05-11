@@ -33,7 +33,6 @@ const erc20Abi = [
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 ];
 const cx1 = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, provider);
-// For sending, we'll use wallet.connect(provider) for treasury, and player wallets already connected.
 
 // ========== STATE ==========
 let rooms = {};
@@ -74,7 +73,6 @@ async function saveData() {
 }
 
 // ========== LOGIKA GAME (ERC‑20) ==========
-
 function checkRoomCompletion(roomId) {
   const room = rooms[roomId];
   if (!room || room.status !== "waiting") return;
@@ -161,8 +159,8 @@ async function handleCX1Transfer(from, to, value, event) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
 
-  // Hanya transfer ke treasury
-  if (to.toLowerCase() !== treasuryAddress.toLowerCase()) return;
+  // Hanya transfer ke treasury (toLowerCase untuk jaga-jaga)
+  if (!to || to.toLowerCase() !== treasuryAddress.toLowerCase()) return;
 
   // Cari room yang masih waiting dan player dengan wallet 'from' yang statusnya 'registered'
   for (const roomId of Object.keys(rooms)) {
@@ -189,8 +187,9 @@ async function handleCX1Transfer(from, to, value, event) {
 
 // ========== AUTO GAME (sekali main) ==========
 async function autoPlayRoom(betAmount, secretNumber) {
-  if (!player1 || !player2)
+  if (!player1 || !player2) {
     throw new Error("Player wallets not configured. Set PRIVATE_KEY_PLAYER1 and PRIVATE_KEY_PLAYER2 in .env");
+  }
   if (!CX1_TOKEN_ADDRESS) throw new Error("CX1_TOKEN_ADDRESS not set");
 
   roomCounter++;
@@ -236,8 +235,7 @@ async function autoPlayRoom(betAmount, secretNumber) {
   ]);
   console.log(`Both CX1 payments confirmed for room ${roomId}`);
 
-  // Pemrosesan via event Transfer akan terjadi, tapi kita paksa agar langsung dicek
-  // (bisa juga menunggu beberapa detik)
+  // Tunggu sebentar agar event Transfer terpantau, lalu paksa cek resolusi
   await new Promise(r => setTimeout(r, 2000));
   await checkRoomCompletion(roomId);
   return rooms[roomId];
@@ -265,7 +263,7 @@ async function startAutoLoop(betAmount) {
     } catch (err) {
       console.error(`Auto-loop error at game #${autoLoopCount}:`, err.message);
     }
-  }, 30000);
+  }, 30000); // setiap 30 detik
 }
 
 function stopAutoLoop() {
@@ -425,7 +423,15 @@ app.get("/api/auto-loop/status", (req, res) => {
   res.json({ active: autoLoopActive, count: autoLoopCount, betAmount: autoLoopBetAmount });
 });
 
-// ========== LISTEN TO CX1 TRANSFERS ==========
+// ========== KONFIGURASI UNTUK FRONTEND ==========
+app.get("/api/config", (req, res) => {
+  res.json({
+    treasuryAddress,
+    cx1TokenAddress: CX1_TOKEN_ADDRESS,
+  });
+});
+
+// ========== LISTENER CX1 TRANSFERS ==========
 async function setupEventListener() {
   // Filter Transfer events where 'to' is treasuryAddress
   const filter = cx1.filters.Transfer(null, treasuryAddress);
@@ -437,6 +443,13 @@ async function setupEventListener() {
     }
   });
   console.log("Listening for CX1 transfers...");
+}
+
+// ========== CHECK ALL ROOMS (saat start) ==========
+async function checkAllRooms() {
+  for (const roomId of Object.keys(rooms)) {
+    checkRoomCompletion(parseInt(roomId));
+  }
 }
 
 // ========== START SERVER ==========
@@ -451,23 +464,13 @@ async function main() {
     process.exit(1);
   }
 
-  // Jalankan pengecekan ulang untuk semua room yang ada
   await checkAllRooms();
-
-  // Setup CX1 event listener
   await setupEventListener();
 
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
     console.log(player1 && player2 ? "✅ Auto-game & Auto-loop ready" : "⚠️  Player wallets not set. Auto modes disabled.");
   });
-}
-
-// Fungsi checkAllRooms tetap diperlukan untuk room yang mungkin tertunda
-async function checkAllRooms() {
-  for (const roomId of Object.keys(rooms)) {
-    checkRoomCompletion(parseInt(roomId));
-  }
 }
 
 main().catch(console.error);
