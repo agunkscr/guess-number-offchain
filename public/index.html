@@ -40,14 +40,15 @@
   <div id="roomDetail" class="card" style="display:none"></div>
 
   <h3>🏆 Leaderboard</h3>
-  <pre id="leaderboard">Loading...</pre>
+  <pre id="leaderboard">Memuat...</pre>
 
   <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
   <script>
-    // ========== KONFIGURASI DARI SERVER ==========
+    // Semua alamat diambil dari server
     let TREASURY_ADDRESS = "";
     let CX1_TOKEN_ADDRESS = "";
 
+    // Ambil konfigurasi dari backend
     async function fetchConfig() {
       try {
         const res = await fetch('/api/config');
@@ -61,8 +62,12 @@
         document.getElementById('roomList').innerHTML = '<span class="error">Gagal memuat konfigurasi server.</span>';
       }
     }
-    // Panggil langsung
-    fetchConfig();
+
+    // Panggil config, lalu muat leaderboard & rooms segera
+    fetchConfig().then(() => {
+      loadLeaderboard();
+      refreshRooms();
+    });
 
     // ========== STATE WALLET ==========
     let provider, signer, account, cx1Contract;
@@ -93,6 +98,7 @@
     async function refreshRooms() {
       try {
         const res = await fetch('/api/rooms');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const rooms = await res.json();
         const container = document.getElementById('roomList');
         if (!rooms.length) {
@@ -106,12 +112,16 @@
             ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim CX1</button>` : ''}
           </div>
         `).join('');
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+        document.getElementById('roomList').innerHTML = '<span class="error">Gagal memuat daftar room.</span>';
+      }
     }
 
     async function showRoomDetail(roomId) {
       try {
         const res = await fetch(`/api/rooms/${roomId}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const room = await res.json();
         const div = document.getElementById('roomDetail');
         div.style.display = 'block';
@@ -124,7 +134,9 @@
           <h5>Pemain:</h5>
           <ul>${room.players.map(p => `<li>${p.wallet.substring(0,8)}... - Tebak: ${p.guess ?? '?'} - Status: ${p.status}</li>`).join('')}</ul>
         `;
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error(e);
+      }
     }
 
     // ========== MANUAL MODE ==========
@@ -155,7 +167,6 @@
       const guess = prompt('Masukkan tebakan (1-10):');
       if (!guess || guess < 1 || guess > 10) return;
 
-      // Daftarkan ke server
       const regRes = await fetch(`/api/rooms/${roomId}/register`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -164,7 +175,6 @@
       const regData = await regRes.json();
       if (!regData.success) return alert('Gagal daftar: ' + regData.error);
 
-      // Kirim CX1 ke treasury
       try {
         const res = await fetch(`/api/rooms/${roomId}`);
         const room = await res.json();
@@ -264,24 +274,26 @@
 
     // ========== LEADERBOARD ==========
     async function loadLeaderboard() {
+      const pre = document.getElementById('leaderboard');
       try {
         const res = await fetch('/api/leaderboard');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const pre = document.getElementById('leaderboard');
         if (!data.length) {
           pre.innerText = 'Belum ada pemenang.';
           return;
         }
         pre.innerText = data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n');
-      } catch (e) { console.error(e); }
+      } catch (e) {
+        console.error('Gagal memuat leaderboard:', e);
+        pre.innerText = 'Gagal memuat leaderboard.';
+      }
     }
 
-    // Auto-refresh rooms & leaderboard setiap 5 detik (jika wallet sudah terhubung)
+    // Auto-refresh setiap 5 detik
     setInterval(() => {
-      if (account) {
-        refreshRooms();
-        loadLeaderboard();
-      }
+      refreshRooms();
+      loadLeaderboard();
     }, 5000);
   </script>
 </body>
