@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Guess Number – Autheo CX1 (ERC‑20)</title>
+  <title>Guess Number – Autheo CX1 (Auto)</title>
   <style>
     body { font-family: Arial, sans-serif; padding: 20px; background: #f9f9f9; }
     .card { background: white; border: 1px solid #ddd; border-radius: 8px; padding: 15px; margin: 10px 0; }
@@ -12,28 +12,29 @@
     .error { color: red; }
     .success { color: green; }
     pre { background: #eee; padding: 10px; overflow-x: auto; }
+    .note { font-size: 0.9em; color: #555; }
   </style>
 </head>
 <body>
   <h1>🎯 Tebak Angka (1-10) – Autheo CX1</h1>
-  <button onclick="connectWallet()">🔌 Connect Wallet</button>
+  <button onclick="connectWallet()">🔌 Connect Wallet (untuk main manual)</button>
   <span id="accountDisplay"></span>
 
   <hr>
 
-  <div id="adminSection" style="display:none">
-    <h3>Admin Panel</h3>
-    <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password"><br>
-    <input id="maxPlayers" type="number" min="2" value="2" placeholder="Max Players">
-    <input id="betAmount" placeholder="Taruhan (CX1)" value="0.01">
-    <button onclick="createRoom()">Buat Room Manual</button>
-    <button onclick="autoGame()" style="background:#e67e22;">⚡ Auto Game (sekali)</button>
-    <hr>
-    <button onclick="startAutoLoop()" style="background:#27ae60;">▶ Mulai Auto-Loop</button>
-    <button onclick="stopAutoLoop()" style="background:#c0392b;">⏹ Hentikan Loop</button>
-    <span id="loopStatus"></span>
-    <div id="adminStatus"></div>
-  </div>
+  <!-- Admin Panel SELALU TERLIHAT -->
+  <h3>⚙️ Admin Panel</h3>
+  <input id="apiKey" placeholder="Admin API Key" value="supersecret" type="password"><br>
+  <input id="maxPlayers" type="number" min="2" value="2" placeholder="Max Players">
+  <input id="betAmount" placeholder="Taruhan (CX1)" value="0.01">
+  <button onclick="createRoom()">Buat Room Manual</button>
+  <button onclick="autoGame()" style="background:#e67e22;">⚡ Auto Game (sekali)</button>
+  <hr>
+  <button onclick="startAutoLoop()" style="background:#27ae60;">▶ Mulai Auto-Loop</button>
+  <button onclick="stopAutoLoop()" style="background:#c0392b;">⏹ Hentikan Loop</button>
+  <span id="loopStatus"></span>
+  <div id="adminStatus"></div>
+  <p class="note">* Auto‑game & loop berjalan dengan wallet server (tidak perlu Connect Wallet).</p>
 
   <h3>📋 Daftar Room</h3>
   <div id="roomList">Loading...</div>
@@ -44,61 +45,57 @@
 
   <script src="https://cdn.ethers.io/lib/ethers-5.7.umd.min.js"></script>
   <script>
-    // Semua alamat diambil dari server
+    // Konfigurasi dari server
     let TREASURY_ADDRESS = "";
     let CX1_TOKEN_ADDRESS = "";
 
-    // Ambil konfigurasi dari backend
     async function fetchConfig() {
       try {
         const res = await fetch('/api/config');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const config = await res.json();
         TREASURY_ADDRESS = config.treasuryAddress;
         CX1_TOKEN_ADDRESS = config.cx1TokenAddress;
         console.log("Config loaded:", { TREASURY_ADDRESS, CX1_TOKEN_ADDRESS });
+        // Load rooms & leaderboard langsung
+        loadLeaderboard();
+        refreshRooms();
       } catch (e) {
-        console.error("Gagal mengambil config:", e);
+        console.error(e);
         document.getElementById('roomList').innerHTML = '<span class="error">Gagal memuat konfigurasi server.</span>';
+        document.getElementById('leaderboard').innerText = 'Gagal memuat konfigurasi.';
       }
     }
+    fetchConfig(); // Langsung panggil
 
-    // Panggil config, lalu muat leaderboard & rooms segera
-    fetchConfig().then(() => {
-      loadLeaderboard();
-      refreshRooms();
-    });
-
-    // ========== STATE WALLET ==========
+    // State wallet (untuk manual play)
     let provider, signer, account, cx1Contract;
 
     async function connectWallet() {
-      if (!window.ethereum) return alert('Install MetaMask!');
-      provider = new ethers.providers.Web3Provider(window.ethereum);
-      await provider.send("eth_requestAccounts", []);
-      signer = provider.getSigner();
-      account = await signer.getAddress();
-      document.getElementById('accountDisplay').innerText = `${account.substring(0,10)}...`;
-      document.getElementById('adminSection').style.display = 'block';
-
-      // Pastikan alamat token CX1 sudah terisi
-      if (!CX1_TOKEN_ADDRESS) {
-        await fetchConfig();
-        if (!CX1_TOKEN_ADDRESS) return alert('Gagal memuat alamat token CX1.');
+      if (typeof window.ethereum === 'undefined') {
+        alert('MetaMask tidak terdeteksi!');
+        return;
       }
+      try {
+        provider = new ethers.providers.Web3Provider(window.ethereum);
+        const accounts = await provider.send("eth_requestAccounts", []);
+        if (accounts.length === 0) return;
+        signer = provider.getSigner();
+        account = accounts[0];
+        document.getElementById('accountDisplay').innerText = `Wallet: ${account.substring(0,10)}...`;
 
-      const erc20Abi = ["function transfer(address to, uint256 amount) returns (bool)"];
-      cx1Contract = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, signer);
-
-      refreshRooms();
-      loadLeaderboard();
+        if (!CX1_TOKEN_ADDRESS) await fetchConfig();
+        const erc20Abi = ["function transfer(address to, uint256 amount) returns (bool)"];
+        cx1Contract = new ethers.Contract(CX1_TOKEN_ADDRESS, erc20Abi, signer);
+        console.log("Wallet siap untuk main manual.");
+      } catch (err) {
+        alert('Gagal hubungkan wallet: ' + err.message);
+      }
     }
 
     // ========== ROOMS ==========
     async function refreshRooms() {
       try {
         const res = await fetch('/api/rooms');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const rooms = await res.json();
         const container = document.getElementById('roomList');
         if (!rooms.length) {
@@ -112,16 +109,12 @@
             ${r.status === 'waiting' && r.playerCount < r.maxPlayers ? `<button onclick="registerPlayer(${r.id})">Daftar & Kirim CX1</button>` : ''}
           </div>
         `).join('');
-      } catch (e) {
-        console.error(e);
-        document.getElementById('roomList').innerHTML = '<span class="error">Gagal memuat daftar room.</span>';
-      }
+      } catch (e) { console.error(e); }
     }
 
     async function showRoomDetail(roomId) {
       try {
         const res = await fetch(`/api/rooms/${roomId}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const room = await res.json();
         const div = document.getElementById('roomDetail');
         div.style.display = 'block';
@@ -134,16 +127,15 @@
           <h5>Pemain:</h5>
           <ul>${room.players.map(p => `<li>${p.wallet.substring(0,8)}... - Tebak: ${p.guess ?? '?'} - Status: ${p.status}</li>`).join('')}</ul>
         `;
-      } catch (e) {
-        console.error(e);
-      }
+      } catch (e) { console.error(e); }
     }
 
-    // ========== MANUAL MODE ==========
+    // ========== MANUAL (HANYA JIKA WALLET TERHUBUNG) ==========
     async function createRoom() {
       const apiKey = document.getElementById('apiKey').value;
       const maxPlayers = document.getElementById('maxPlayers').value;
       const betAmount = document.getElementById('betAmount').value;
+      // Tidak butuh wallet – langsung panggil API
       try {
         const res = await fetch('/api/rooms', {
           method: 'POST',
@@ -153,7 +145,7 @@
         const data = await res.json();
         const statusDiv = document.getElementById('adminStatus');
         if (data.roomId) {
-          statusDiv.innerHTML = `<span class="success">Room ${data.roomId} dibuat. Treasury: ${data.treasuryAddress}</span>`;
+          statusDiv.innerHTML = `<span class="success">Room ${data.roomId} dibuat.</span>`;
           refreshRooms();
         } else {
           statusDiv.innerHTML = `<span class="error">Error: ${data.error}</span>`;
@@ -162,8 +154,7 @@
     }
 
     async function registerPlayer(roomId) {
-      if (!account) return alert('Hubungkan wallet dulu!');
-      if (!cx1Contract) return alert('Token CX1 belum diinisialisasi.');
+      if (!account) return alert('Hubungkan wallet dulu untuk main manual.');
       const guess = prompt('Masukkan tebakan (1-10):');
       if (!guess || guess < 1 || guess > 10) return;
 
@@ -182,14 +173,12 @@
         const tx = await cx1Contract.transfer(TREASURY_ADDRESS, betWei);
         alert('CX1 dikirim, tx: ' + tx.hash);
         await tx.wait();
-        alert('Transfer CX1 terkonfirmasi!');
+        alert('Transfer terkonfirmasi!');
         refreshRooms();
-      } catch (e) {
-        alert('Gagal transfer CX1: ' + e.message);
-      }
+      } catch (e) { alert('Gagal transfer CX1: ' + e.message); }
     }
 
-    // ========== AUTO MODE (SEKALI) ==========
+    // ========== AUTO (TIDAK BUTUH WALLET) ==========
     async function autoGame() {
       const apiKey = document.getElementById('apiKey').value;
       const betAmount = document.getElementById('betAmount').value;
@@ -214,7 +203,6 @@
       }
     }
 
-    // ========== AUTO LOOP ==========
     async function startAutoLoop() {
       const apiKey = document.getElementById('apiKey').value;
       const betAmount = document.getElementById('betAmount').value;
@@ -243,31 +231,24 @@
       const statusEl = document.getElementById('loopStatus');
       statusEl.innerText = 'Menghentikan...';
       try {
-        const res = await fetch('/api/auto-loop/stop', {
+        await fetch('/api/auto-loop/stop', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey }
         });
-        const data = await res.json();
         statusEl.innerText = 'Loop dihentikan.';
-      } catch (e) {
-        statusEl.innerText = 'Gagal: ' + e.message;
-      }
+      } catch (e) { statusEl.innerText = 'Gagal: ' + e.message; }
     }
 
     async function monitorLoopStatus() {
       const statusEl = document.getElementById('loopStatus');
       const interval = setInterval(async () => {
-        try {
-          const res = await fetch('/api/auto-loop/status');
-          const data = await res.json();
-          if (!data.active) {
-            statusEl.innerText = `Berhenti. Total game: ${data.count}`;
-            clearInterval(interval);
-          } else {
-            statusEl.innerText = `Game #${data.count}... (taruhan ${data.betAmount})`;
-          }
-        } catch (e) {
-          console.error(e);
+        const res = await fetch('/api/auto-loop/status');
+        const data = await res.json();
+        if (!data.active) {
+          statusEl.innerText = `Berhenti. Total game: ${data.count}`;
+          clearInterval(interval);
+        } else {
+          statusEl.innerText = `Game #${data.count}... (taruhan ${data.betAmount})`;
         }
       }, 2000);
     }
@@ -277,20 +258,14 @@
       const pre = document.getElementById('leaderboard');
       try {
         const res = await fetch('/api/leaderboard');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        if (!data.length) {
-          pre.innerText = 'Belum ada pemenang.';
-          return;
-        }
-        pre.innerText = data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n');
-      } catch (e) {
-        console.error('Gagal memuat leaderboard:', e);
-        pre.innerText = 'Gagal memuat leaderboard.';
-      }
+        pre.innerText = data.length
+          ? data.map(e => `${e.wallet.substring(0,10)}... : ${e.wins} menang`).join('\n')
+          : 'Belum ada pemenang.';
+      } catch (e) { pre.innerText = 'Gagal memuat leaderboard.'; }
     }
 
-    // Auto-refresh setiap 5 detik
+    // Auto-refresh tiap 5 detik
     setInterval(() => {
       refreshRooms();
       loadLeaderboard();
